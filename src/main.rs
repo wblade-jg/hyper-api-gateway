@@ -1,6 +1,8 @@
-use http_body_util::Full;
+use http_body_util::{BodyExt, Full};
+use hyper::body::Buf;
 use hyper::{Request, Response, StatusCode, body::Bytes, server::conn::http1, service::service_fn};
 use hyper_util::rt::TokioIo;
+use serde::Deserialize;
 use services::Service;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -55,7 +57,9 @@ async fn start_service_registry(
             if let Err(_) = http1::Builder::new()
                 .serve_connection(
                     io_stream,
-                    service_fn(|req| handle_registry(req, server_address.ip(), Arc::clone(&services))),
+                    service_fn(|req| {
+                        handle_registry(req, server_address.ip(), Arc::clone(&services))
+                    }),
                 )
                 .await
             {
@@ -65,28 +69,58 @@ async fn start_service_registry(
     }
 }
 
+#[derive(Deserialize)]
+struct RegisterServiceInfo {
+    route_prefix: String,
+    port: u16,
+}
+
 async fn handle_registry(
     req: Request<hyper::body::Incoming>,
     ip_address: IpAddr,
     services: Arc<RwLock<HashMap<String, Service>>>,
 ) -> Result<Response<Full<Bytes>>, Infallible> {
     println!("{:?}", ip_address);
-
     let mut response = Response::builder().body(Full::new(Bytes::new())).unwrap();
 
     if req.uri().path() == "/register" {
         println!("{ip_address}");
+        if let Some(payload) = get_payload(req.into_body()).await {
+            let mut _services = services.write().await;
+            let new_server_address = format!("{}:{}", ip_address, payload.port);
 
-        let mut _services = services.write().await;
-        if let Some(new_service) = _services.get_mut("/users"){
-            new_service.add_instance_server(format!("{}:3000", ip_address));
+            if let Some(new_service) = _services.get_mut(&payload.route_prefix) {
+                new_service.add_instance_server(String::from(new_server_address));
+                println!("Servicio actualizado: {}", &payload.route_prefix);
+            } else {
+                let mut new_service = Service::new();
+                new_service.add_instance_server(String::from(new_server_address));
+                _services.insert(String::from(&payload.route_prefix), new_service);
+                println!("Servicio registrado: {}", &payload.route_prefix);
+            }
             *response.status_mut() = StatusCode::ACCEPTED;
+        } else {
+            println!("Error en la solicitud");
+            *response.status_mut() = StatusCode::NOT_FOUND;
         }
-        *response.status_mut() = StatusCode::NOT_FOUND;
-    }else{
+    } else {
         *response.status_mut() = StatusCode::NOT_FOUND;
     }
+
     Ok(response)
+}
+
+async fn get_payload(req_body: hyper::body::Incoming) -> Option<RegisterServiceInfo> {
+    if let Ok(collected) = req_body.collect().await {
+        let reader = collected.aggregate().reader();
+        if let Ok(payload) = serde_json::from_reader::<_, RegisterServiceInfo>(reader) {
+            Some(payload)
+        } else {
+            None
+        }
+    } else {
+        None
+    }
 }
 
 async fn start_client_proxy_server(
