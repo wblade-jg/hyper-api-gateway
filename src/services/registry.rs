@@ -1,4 +1,4 @@
-use crate::{load_balancing::LoadBalancingStrategy, round_robin::RoundRobin};
+use crate::services::Service;
 use http_body_util::{BodyExt, Full};
 use hyper::body::Buf;
 use hyper::{Request, Response, StatusCode, body::Bytes, server::conn::http1, service::service_fn};
@@ -11,90 +11,18 @@ use std::{
     net::{IpAddr, Ipv4Addr, SocketAddr},
 };
 use tokio::net::TcpListener;
-use tokio::sync::Mutex;
 use tokio::sync::RwLock;
-use tokio::time::Instant;
 use tracing::{Instrument, error, info, info_span, warn};
-
-pub struct Service {
-    servers_list: Vec<ServerInstance>,
-    load_balancer: Mutex<Box<dyn LoadBalancingStrategy + Send>>,
-}
-
-pub struct ServerInstance {
-    ip_addr: String,
-    port: u16,
-    last_ping: Mutex<Instant>,
-}
-
-impl ServerInstance {
-    pub fn new(ip_addr: String) -> Self {
-        let sock_addr: SocketAddr = ip_addr.parse().unwrap();
-        Self {
-            ip_addr: sock_addr.ip().to_string(),
-            port: sock_addr.port(),
-            last_ping: Mutex::new(Instant::now()),
-        }
-    }
-
-    pub fn port(&self) -> u16 {
-        self.port
-    }
-
-    pub async fn last_ping(&self, new_last_ping: Instant) {
-        let mut last_ping = self.last_ping.lock().await;
-        *last_ping = new_last_ping;
-    }
-}
-
-#[derive(Deserialize)]
-struct RegisterServiceInfo {
-    route_prefix: String,
-    port: u16,
-}
 
 pub struct ServiceRegistry {
     port: u16,
     services_map: Arc<RwLock<HashMap<String, Service>>>,
 }
 
-impl Service {
-    pub fn new() -> Self {
-        Self {
-            servers_list: Vec::new(),
-            load_balancer: Mutex::new(Box::new(RoundRobin::new())),
-        }
-    }
-
-    pub fn add_instance_server(&mut self, sock_addr: String) {
-        self.servers_list.push(ServerInstance::new(sock_addr));
-    }
-
-    pub async fn get_server_instance_to_send(&self) -> String {
-        let mut balancer = self.load_balancer.lock().await;
-        balancer.num_servers(self.servers_list.len());
-        let index = balancer.get_next_index();
-        String::from(&self.servers_list[index].ip_addr)
-    }
-
-    pub fn get_server_from_ip(&self, ip_addr: &str) -> Option<&ServerInstance> {
-        self.servers_list
-            .iter()
-            .find(|element| element.ip_addr == ip_addr)
-    }
-}
-
-fn get_available_services() -> HashMap<String, Service> {
-    let mut services_map: HashMap<String, Service> = HashMap::new();
-    let mut new_service = Service::new();
-
-    new_service.add_instance_server(String::from("192.168.100.10:3000"));
-    new_service.add_instance_server(String::from("192.168.100.20:3000"));
-    new_service.add_instance_server(String::from("192.168.100.30:3000"));
-    new_service.add_instance_server(String::from("192.168.100.40:3000"));
-
-    services_map.insert(String::from("/users"), new_service);
-    services_map
+#[derive(Deserialize)]
+struct RegisterServiceInfo {
+    route_prefix: String,
+    port: u16,
 }
 
 impl ServiceRegistry {
@@ -186,6 +114,19 @@ impl ServiceRegistry {
 
         Ok(response)
     }
+}
+
+fn get_available_services() -> HashMap<String, Service> {
+    let mut services_map: HashMap<String, Service> = HashMap::new();
+    let mut new_service = Service::new();
+
+    new_service.add_instance_server(String::from("192.168.100.10:3000"));
+    new_service.add_instance_server(String::from("192.168.100.20:3000"));
+    new_service.add_instance_server(String::from("192.168.100.30:3000"));
+    new_service.add_instance_server(String::from("192.168.100.40:3000"));
+
+    services_map.insert(String::from("/users"), new_service);
+    services_map
 }
 
 async fn get_payload(req_body: hyper::body::Incoming) -> Option<RegisterServiceInfo> {

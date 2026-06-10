@@ -1,17 +1,15 @@
-use crate::services::ServiceRegistry;
+use crate::services::{HealthChecker, Service, ServiceRegistry};
 use http_body_util::Full;
 use hyper::{Request, Response, body::Bytes, server::conn::http1, service::service_fn};
 use hyper_util::rt::TokioIo;
-use services::Service;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::{
     convert::Infallible,
     net::{IpAddr, Ipv4Addr, SocketAddr},
 };
-use tokio::net::{TcpListener, UdpSocket};
+use tokio::net::TcpListener;
 use tokio::sync::RwLock;
-use tokio::time::Instant;
 use tracing::{Instrument, Level, error, info, info_span, instrument, warn};
 
 mod load_balancing;
@@ -36,19 +34,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let service_registry = ServiceRegistry::new(8500);
     let services_map = service_registry.get_available_services();
-
-    let service_map_for_health_checker = Arc::clone(&services_map);
-    let service_map_for_proxy_server = Arc::clone(&services_map);
-
-    tokio::spawn(
-        (async move {
-            if let Err(e) = start_heath_checker(8505, service_map_for_health_checker).await {
-                error!("Error crítico en el health checker: {e}");
-            }
-        })
-        .instrument(info_span!("health_checker_thread")),
-    );
-
+    
     tokio::spawn(
         (async move {
             if let Err(e) = service_registry.start_service_registry().await {
@@ -58,49 +44,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .instrument(info_span!("registry_thread")),
     );
 
+    let service_map_for_health_checker = Arc::clone(&services_map);
+    let service_map_for_proxy_server = Arc::clone(&services_map);
+
+    let health_checker = HealthChecker::new(8505, service_map_for_health_checker);
+
+    tokio::spawn(
+        (async move {
+            if let Err(e) = health_checker.start_heath_checker().await {
+                error!("Error crítico en el health checker: {e}");
+            }
+        })
+        .instrument(info_span!("health_checker_thread")),
+    );
+    
     start_client_proxy_server(listener, service_map_for_proxy_server).await?;
 
     Ok(())
-}
-
-async fn start_heath_checker(
-    port: u16,
-    services_map: Arc<RwLock<HashMap<String, Service>>>,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let socket_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), port);
-    let socket = UdpSocket::bind(socket_addr).await?;
-    let mut buffer = [0; 1024];
-
-    info!("Health checker activo en el puerto: {}", port);
-
-    let services = Arc::clone(&services_map);
-
-    loop {
-        let (len, addr) = socket.recv_from(&mut buffer).await?;
-        let datos_recibidos = &buffer[..len];
-
-        if let Ok(mensaje) = std::str::from_utf8(datos_recibidos) {
-            let mensaje = mensaje.trim();
-            let ping_span = info_span!("udp_ping", servicio = %mensaje, cliente = %addr.ip());
-            let mut _services = services.read().await;
-            async {
-                if let Some(service) = _services.get(mensaje) {
-                    if let Some(server) = service.get_server_from_ip(&addr.ip().to_string()) {
-                        server.last_ping(Instant::now()).await;
-                        info!("Heartbeat registrado");
-                    } else {
-                        warn!("El servidor emisor no está registrado en este servicio");
-                    }
-                } else {
-                    warn!("Intento de ping de un servicio no configurado");
-                }
-            }
-            .instrument(ping_span)
-            .await;
-        } else {
-            warn!(from = %addr.ip(), "No se pudo parsear el paquete UDP a UTF-8");
-        }
-    }
 }
 
 async fn start_client_proxy_server(
