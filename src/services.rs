@@ -6,17 +6,18 @@ use hyper_util::rt::TokioIo;
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::sync::Mutex;
 use std::{
     convert::Infallible,
     net::{IpAddr, Ipv4Addr, SocketAddr},
 };
 use tokio::net::TcpListener;
+use tokio::sync::Mutex;
 use tokio::sync::RwLock;
 use tokio::time::Instant;
+use tracing::{Instrument, error, info, info_span, warn};
 
 pub struct Service {
-    servers_list: Vec<Box<ServerInstance>>,
+    servers_list: Vec<ServerInstance>,
     load_balancer: Mutex<Box<dyn LoadBalancingStrategy + Send>>,
 }
 
@@ -27,21 +28,21 @@ pub struct ServerInstance {
 }
 
 impl ServerInstance {
-    pub fn new(ip_addr: String) -> Box<Self> {
+    pub fn new(ip_addr: String) -> Self {
         let sock_addr: SocketAddr = ip_addr.parse().unwrap();
-        Box::new(Self {
+        Self {
             ip_addr: sock_addr.ip().to_string(),
             port: sock_addr.port(),
             last_ping: Mutex::new(Instant::now()),
-        })
+        }
     }
 
     pub fn port(&self) -> u16 {
         self.port
     }
 
-    pub fn last_ping(&self, new_last_ping: Instant) {
-        let mut last_ping = self.last_ping.lock().unwrap();
+    pub async fn last_ping(&self, new_last_ping: Instant) {
+        let mut last_ping = self.last_ping.lock().await;
         *last_ping = new_last_ping;
     }
 }
@@ -69,14 +70,14 @@ impl Service {
         self.servers_list.push(ServerInstance::new(sock_addr));
     }
 
-    pub fn get_server_instance_to_send(&self) -> String {
-        let mut balancer = self.load_balancer.lock().unwrap();
+    pub async fn get_server_instance_to_send(&self) -> String {
+        let mut balancer = self.load_balancer.lock().await;
         balancer.num_servers(self.servers_list.len());
         let index = balancer.get_next_index();
         String::from(&self.servers_list[index].ip_addr)
     }
 
-    pub fn get_server_from_ip(&self, ip_addr: &str) -> Option<&Box<ServerInstance>> {
+    pub fn get_server_from_ip(&self, ip_addr: &str) -> Option<&ServerInstance> {
         self.servers_list
             .iter()
             .find(|element| element.ip_addr == ip_addr)
@@ -112,7 +113,7 @@ impl ServiceRegistry {
         let socket = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), self.port);
         let listener = TcpListener::bind(socket).await?;
 
-        println!("Service registry escuchando en el puerto: {}", self.port);
+        info!("Service Registry activo en el puerto: {}", self.port);
 
         let registry_map = Arc::clone(&self.services_map);
 
@@ -121,23 +122,28 @@ impl ServiceRegistry {
             let io_stream = TokioIo::new(stream);
             let connection_map = Arc::clone(&registry_map);
 
-            tokio::spawn(async move {
-                if let Err(_) = http1::Builder::new()
-                    .serve_connection(
-                        io_stream,
-                        service_fn(|req| {
-                            Self::handle_registry(
-                                req,
-                                server_address.ip(),
-                                Arc::clone(&connection_map),
-                            )
-                        }),
-                    )
-                    .await
-                {
-                    println!("Error sirviendo conexion en el service registry");
-                }
-            });
+            let connection_span = info_span!("http_conn", from = %server_address.ip());
+
+            tokio::spawn(
+                (async move {
+                    if let Err(_) = http1::Builder::new()
+                        .serve_connection(
+                            io_stream,
+                            service_fn(|req| {
+                                Self::handle_registry(
+                                    req,
+                                    server_address.ip(),
+                                    Arc::clone(&connection_map),
+                                )
+                            }),
+                        )
+                        .await
+                    {
+                        warn!("Error al servir la conexion");
+                    }
+                })
+                .instrument(connection_span),
+            );
         }
     }
 
@@ -146,30 +152,35 @@ impl ServiceRegistry {
         ip_address: IpAddr,
         services: Arc<RwLock<HashMap<String, Service>>>,
     ) -> Result<Response<Full<Bytes>>, Infallible> {
-        println!("{:?}", ip_address);
         let mut response = Response::builder().body(Full::new(Bytes::new())).unwrap();
 
         if req.uri().path() == "/register" {
-            println!("{ip_address}");
             if let Some(payload) = get_payload(req.into_body()).await {
                 let mut _services = services.write().await;
                 let new_server_address = format!("{}:{}", ip_address, payload.port);
 
                 if let Some(new_service) = _services.get_mut(&payload.route_prefix) {
-                    new_service.add_instance_server(String::from(new_server_address));
-                    println!("Servicio actualizado: {}", &payload.route_prefix);
+                    new_service.add_instance_server(String::from(&new_server_address));
+                    info!(
+                        "Instancia agregada a servicio existe: {}, direccion: {}",
+                        &payload.route_prefix, &new_server_address
+                    );
                 } else {
                     let mut new_service = Service::new();
-                    new_service.add_instance_server(String::from(new_server_address));
+                    new_service.add_instance_server(String::from(&new_server_address));
                     _services.insert(String::from(&payload.route_prefix), new_service);
-                    println!("Servicio registrado: {}", &payload.route_prefix);
+                    info!(
+                        "Nuevo servicio registrado con exito: {}, direccion inicial: {}",
+                        &payload.route_prefix, &new_server_address
+                    );
                 }
                 *response.status_mut() = StatusCode::ACCEPTED;
             } else {
-                println!("Error en la solicitud");
+                error!("Error al registrar: El cuerpo de la solicitud no es válido");
                 *response.status_mut() = StatusCode::NOT_FOUND;
             }
         } else {
+            warn!("Acceso a ruta no válida: {}", req.uri().path());
             *response.status_mut() = StatusCode::NOT_FOUND;
         }
 
