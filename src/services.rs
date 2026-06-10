@@ -13,10 +13,37 @@ use std::{
 };
 use tokio::net::TcpListener;
 use tokio::sync::RwLock;
+use tokio::time::Instant;
 
 pub struct Service {
-    servers_list: Vec<String>,
+    servers_list: Vec<Box<ServerInstance>>,
     load_balancer: Mutex<Box<dyn LoadBalancingStrategy + Send>>,
+}
+
+pub struct ServerInstance {
+    ip_addr: String,
+    port: u16,
+    last_ping: Mutex<Instant>,
+}
+
+impl ServerInstance {
+    pub fn new(ip_addr: String) -> Box<Self> {
+        let sock_addr: SocketAddr = ip_addr.parse().unwrap();
+        Box::new(Self {
+            ip_addr: sock_addr.ip().to_string(),
+            port: sock_addr.port(),
+            last_ping: Mutex::new(Instant::now()),
+        })
+    }
+
+    pub fn port(&self) -> u16 {
+        self.port
+    }
+
+    pub fn last_ping(&self, new_last_ping: Instant) {
+        let mut last_ping = self.last_ping.lock().unwrap();
+        *last_ping = new_last_ping;
+    }
 }
 
 #[derive(Deserialize)]
@@ -38,15 +65,21 @@ impl Service {
         }
     }
 
-    pub fn add_instance_server(&mut self, ip_server: String) {
-        self.servers_list.push(ip_server);
+    pub fn add_instance_server(&mut self, sock_addr: String) {
+        self.servers_list.push(ServerInstance::new(sock_addr));
     }
 
     pub fn get_server_instance_to_send(&self) -> String {
         let mut balancer = self.load_balancer.lock().unwrap();
         balancer.num_servers(self.servers_list.len());
         let index = balancer.get_next_index();
-        String::from(&self.servers_list[index])
+        String::from(&self.servers_list[index].ip_addr)
+    }
+
+    pub fn get_server_from_ip(&self, ip_addr: &str) -> Option<&Box<ServerInstance>> {
+        self.servers_list
+            .iter()
+            .find(|element| element.ip_addr == ip_addr)
     }
 }
 
@@ -54,10 +87,10 @@ fn get_available_services() -> HashMap<String, Service> {
     let mut services_map: HashMap<String, Service> = HashMap::new();
     let mut new_service = Service::new();
 
-    new_service.add_instance_server(String::from("192.168.100.10"));
-    new_service.add_instance_server(String::from("192.168.100.20"));
-    new_service.add_instance_server(String::from("192.168.100.30"));
-    new_service.add_instance_server(String::from("192.168.100.40"));
+    new_service.add_instance_server(String::from("192.168.100.10:3000"));
+    new_service.add_instance_server(String::from("192.168.100.20:3000"));
+    new_service.add_instance_server(String::from("192.168.100.30:3000"));
+    new_service.add_instance_server(String::from("192.168.100.40:3000"));
 
     services_map.insert(String::from("/users"), new_service);
     services_map
@@ -80,7 +113,7 @@ impl ServiceRegistry {
         let listener = TcpListener::bind(socket).await?;
 
         println!("Service registry escuchando en el puerto: {}", self.port);
-        
+
         let registry_map = Arc::clone(&self.services_map);
 
         loop {
@@ -93,7 +126,11 @@ impl ServiceRegistry {
                     .serve_connection(
                         io_stream,
                         service_fn(|req| {
-                            Self::handle_registry(req, server_address.ip(), Arc::clone(&connection_map))
+                            Self::handle_registry(
+                                req,
+                                server_address.ip(),
+                                Arc::clone(&connection_map),
+                            )
                         }),
                     )
                     .await
