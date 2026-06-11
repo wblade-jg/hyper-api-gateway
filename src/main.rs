@@ -34,7 +34,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let service_registry = ServiceRegistry::new(8500);
     let services_map = service_registry.get_available_services();
-    
+    let instances_map_for_health_checker = service_registry.get_all_instances();
+
     tokio::spawn(
         (async move {
             if let Err(e) = service_registry.start_service_registry().await {
@@ -44,10 +45,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .instrument(info_span!("registry_thread")),
     );
 
-    let service_map_for_health_checker = Arc::clone(&services_map);
-    let service_map_for_proxy_server = Arc::clone(&services_map);
-
-    let health_checker = HealthChecker::new(8505, service_map_for_health_checker);
+    let health_checker = HealthChecker::new(8505, instances_map_for_health_checker);
 
     tokio::spawn(
         (async move {
@@ -57,8 +55,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         })
         .instrument(info_span!("health_checker_thread")),
     );
-    
-    start_client_proxy_server(listener, service_map_for_proxy_server).await?;
+
+    start_client_proxy_server(listener, services_map).await?;
 
     Ok(())
 }
@@ -76,7 +74,7 @@ async fn start_client_proxy_server(
 
         tokio::spawn(
             (async move {
-                if let Err(_) = http1::Builder::new()
+                if http1::Builder::new()
                 .serve_connection(
                     io_stream,
                     service_fn(|req| {
@@ -85,7 +83,7 @@ async fn start_client_proxy_server(
                         handle_request(req, Arc::clone(&services)).instrument(req_span)
                     }),
                 )
-                .await
+                .await.is_err()
             {
                 warn!("Error al servir la conexion");
             }
