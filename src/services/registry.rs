@@ -30,11 +30,15 @@ struct RegisterServiceInfo {
 
 impl ServiceRegistry {
     pub fn new(port: u16) -> Self {
+        let id = Arc::new(AtomicU64::new(0));
+        let mut instances = HashMap::new();
+        let mut services = HashMap::new();
+        init_mock(Arc::clone(&id), &mut services, &mut instances);
         Self {
             port,
-            instances_map: Arc::new(RwLock::new(HashMap::new())),
-            services_map: Arc::new(RwLock::new(get_available_services())),
-            id_gen: Arc::new(AtomicU64::new(0)),
+            instances_map: Arc::new(RwLock::new(instances)),
+            id_gen: Arc::clone(&id),
+            services_map: Arc::new(RwLock::new(services)),
         }
     }
 
@@ -110,8 +114,12 @@ impl ServiceRegistry {
             let mut _instances = instances.write().await;
             let id = id_gen.fetch_add(1, Ordering::SeqCst);
 
-            let new_server_instance =
-                Arc::new(ServerInstance::new(ip_address.to_string(), payload.port));
+            let new_server_instance = Arc::new(ServerInstance::new(
+                id,
+                String::from(&payload.route_prefix),
+                ip_address.to_string(),
+                payload.port,
+            ));
 
             if let Some(service) = _services.get_mut(&payload.route_prefix) {
                 service.add_instance_server(Arc::clone(&new_server_instance));
@@ -160,29 +168,52 @@ impl ServiceRegistry {
     }
 }
 
-fn get_available_services() -> HashMap<String, Service> {
-    let mut services_map: HashMap<String, Service> = HashMap::new();
+fn init_mock(
+    id_gen: Arc<AtomicU64>,
+    services_map: &mut HashMap<String, Service>,
+    instances_map: &mut HashMap<u64, Arc<ServerInstance>>,
+) {
     let mut new_service = Service::new();
 
-    new_service.add_instance_server(Arc::new(ServerInstance::new(
+    let route = String::from("/users");
+
+    let i1 = Arc::new(ServerInstance::new(
+        id_gen.fetch_add(1, Ordering::SeqCst),
+        route.clone(),
         String::from("192.168.100.10"),
         3000,
-    )));
-    new_service.add_instance_server(Arc::new(ServerInstance::new(
+    ));
+    new_service.add_instance_server(i1.clone());
+    instances_map.insert(i1.id(), i1);
+
+    let i2 = Arc::new(ServerInstance::new(
+        id_gen.fetch_add(1, Ordering::SeqCst),
+        route.clone(),
         String::from("192.168.100.20"),
         3000,
-    )));
-    new_service.add_instance_server(Arc::new(ServerInstance::new(
+    ));
+    new_service.add_instance_server(i2.clone());
+    instances_map.insert(i2.id(), i2);
+
+    let i3 = Arc::new(ServerInstance::new(
+        id_gen.fetch_add(1, Ordering::SeqCst),
+        route.clone(),
         String::from("192.168.100.30"),
         3000,
-    )));
-    new_service.add_instance_server(Arc::new(ServerInstance::new(
+    ));
+    new_service.add_instance_server(i3.clone());
+    instances_map.insert(i3.id(), i3);
+
+    let i4 = Arc::new(ServerInstance::new(
+        id_gen.fetch_add(1, Ordering::SeqCst),
+        route.clone(),
         String::from("192.168.100.40"),
         3000,
-    )));
+    ));
+    new_service.add_instance_server(i4.clone());
+    instances_map.insert(i4.id(), i4);
 
-    services_map.insert(String::from("/users"), new_service);
-    services_map
+    services_map.insert(route, new_service);
 }
 
 async fn get_payload(req_body: hyper::body::Incoming) -> Option<RegisterServiceInfo> {

@@ -46,11 +46,14 @@ impl HealthChecker {
                     let _instances = instances.read().await;
                     _instances.get(&id).cloned()
                 }; //Lo hacemos en un bloque para no bloquear más tiempo del necesario
+                
+                let ack = format!("{{\"id\": {} }}", id).into_bytes();
 
                 async {
                     if let Some(server_instance) = instance {
-                        server_instance.last_ping(Instant::now()).await;
+                        server_instance.update_last_ping(Instant::now()).await;
                         info!("Heartbeat registrado. Instancia [{}]: {}", id, server_instance.socket_addr());
+                        let _ = socket.send_to(&ack, addr).await;
                     } else {
                         warn!("Intento de ping de una instancia no registrada: [{}]", id);
                     }
